@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Work Assign Tool by Kamran — Monday‑style Board</title>
+  <!-- Tailwind via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* Small helpers */
+    .chip { @apply px-2 py-1 rounded-md text-xs font-medium; }
+    .col { grid-template-columns: 1fr 180px 160px 140px 44px; }
+  </style>
+</head>
+<body class="min-h-screen bg-gray-50">
+  <div id="app"></div>
+
+  <!-- Firebase SDKs (modular, ES modules) -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-app.js";
+    import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-auth.js";
+    import { getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, query, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-firestore.js";
+
+    // 1) Firebase config — REPLACE with your real values from Firebase Console
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_AUTH_DOMAIN",
+      projectId: "YOUR_PROJECT_ID",
+      storageBucket: "YOUR_STORAGE_BUCKET",
+      messagingSenderId: "YOUR_SENDER_ID",
+      appId: "YOUR_APP_ID",
+    };
+
+    // 2) Init Firebase
+    const appFB = initializeApp(firebaseConfig);
+    const auth = getAuth(appFB);
+    const db = getFirestore(appFB);
+
+    // ----- UI helpers -----
+    const el = (tag, props = {}, children = []) => {
+      const node = document.createElement(tag);
+      Object.assign(node, props);
+      if (typeof children === 'string') node.innerHTML = children;
+      else children.forEach(c => node.append(c));
+      return node;
+    };
+    const fmtDate = (s) => s ? new Date(s + 'T00:00:00').toLocaleDateString() : '—';
+    const todayISO = () => new Date().toISOString().slice(0,10);
+    const overdue = (task) => task.dueDate && task.status !== 'done' && task.dueDate < todayISO();
+
+    const STATUS = [
+      { value: 'not_started', label: 'Not Started', cls: 'bg-gray-300 text-gray-800' },
+      { value: 'pending',     label: 'Pending',     cls: 'bg-red-500 text-white' },
+      { value: 'in_progress', label: 'Working on it', cls: 'bg-yellow-400 text-gray-900' },
+      { value: 'done',        label: 'Done',        cls: 'bg-emerald-500 text-white' },
+    ];
+    const statusByVal = (v) => STATUS.find(s => s.value === v) || STATUS[0];
+
+    // ----- Render roots -----
+    const root = document.getElementById('app');
+
+    function renderLoading(){
+      root.innerHTML = `
+        <div class="min-h-screen grid place-items-center">
+          <div class="flex items-center gap-3 text-gray-600"><svg class="animate-spin h-5 w-5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" opacity="0.25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="4" fill="none"/></svg> Loading…</div>
+        </div>`;
+    }
+
+    function renderAuth(){
+      root.innerHTML = `
+        <div class="min-h-screen flex items-center justify-center p-4">
+          <div class="w-full max-w-sm bg-white shadow rounded-2xl p-6 space-y-4">
+            <div class="text-center">
+              <h1 class="text-2xl font-semibold">Work Assign Tool by Kamran</h1>
+              <p class="text-sm text-gray-500">Sign in or create an account</p>
+            </div>
+            <div class="space-y-3">
+              <input id="email" type="email" placeholder="Email" class="w-full border rounded-lg px-3 py-2" />
+              <input id="password" type="password" placeholder="Password" class="w-full border rounded-lg px-3 py-2" />
+              <button id="btn-login" class="w-full bg-black text-white rounded-lg py-2">Sign in</button>
+              <button id="btn-signup" class="w-full border rounded-lg py-2">Create account</button>
+            </div>
+            <p class="text-xs text-gray-500">After first login, ask admin to approve your access.</p>
+          </div>
+        </div>`;
+
+      document.getElementById('btn-login').onclick = async () => {
+        try { await signInWithEmailAndPassword(auth, email.value, password.value); }
+        catch(e){ alert(e.message); }
+      };
+      document.getElementById('btn-signup').onclick = async () => {
+        try { await createUserWithEmailAndPassword(auth, email.value, password.value); }
+        catch(e){ alert(e.message); }
+      };
+    }
+
+    function renderAwaitingApproval(userDoc){
+      root.innerHTML = `
+        <div class="min-h-screen grid place-items-center p-6 text-center">
+          <div>
+            <h2 class="text-2xl font-semibold mb-2">Awaiting Approval</h2>
+            <p class="text-gray-600 max-w-md">Your account is pending admin approval. You’ll get access once approved.</p>
+            <div class="mt-6 text-sm text-gray-500">Logged in as ${userDoc.email}</div>
+            <button id="btn-logout" class="mt-4 border rounded-lg px-4 py-2">Sign out</button>
+          </div>
+        </div>`;
+      document.getElementById('btn-logout').onclick = () => signOut(auth);
+    }
+
+    function renderBoard(ctx){
+      const { me, users, tasks } = ctx;
+      root.innerHTML = '';
+
+      // Header
+      const header = el('div', { className: 'flex items-center justify-between p-4 md:p-6' }, [
+        el('div', {}, [
+          el('div', { className: 'text-2xl md:text-3xl font-semibold' }, ['Nets Workspace']),
+          el('div', { className: 'text-gray-500 text-sm' }, ['Monday‑style board — Firebase data'])
+        ]),
+        el('div', { className: 'flex items-center gap-2' }, [
+          el('button', { id:'invite', className:'border rounded-lg px-3 py-2' }, ['Invite / Approve']),
+          el('button', { id:'logout', className:'border rounded-lg px-3 py-2' }, ['Sign out'])
+        ])
+      ]);
+
+      // Toolbar
+      const toolbar = el('div', { className:'px-4 md:px-6 pb-2 flex flex-wrap items-center gap-2' }, []);
+      const q = el('input', { placeholder:'Search task or owner…', className:'border rounded-lg px-3 py-2 w-64' });
+      const statusSel = el('select', { className:'border rounded-lg px-3 py-2' });
+      statusSel.append(el('option', { value:'all' }, ['All statuses']));
+      STATUS.forEach(s => statusSel.append(el('option', { value:s.value }, [s.label])));
+      const sortSel = el('select', { className:'border rounded-lg px-3 py-2' });
+      [['dueAsc','Due date ↑'],['dueDesc','Due date ↓'],['status','Status'],['created','Created time']]
+        .forEach(([v,l])=> sortSel.append(el('option', { value:v }, [l])));
+      toolbar.append(q, statusSel, sortSel);
+
+      // Table header
+      const tableHead = el('div', { className:'hidden md:grid col gap-3 px-6 py-2 text-xs font-medium text-gray-500 border-b' });
+      tableHead.classList.add('grid');
+      tableHead.style.gridTemplateColumns = '1fr 180px 160px 140px 44px';
+      ;['Task','Owner','Status','Due date',''].forEach(t => tableHead.append(el('div',{},[t])));
+
+      // Groups container
+      const groupsWrap = el('div', { className:'px-2 md:px-6 space-y-6' });
+
+      function applyFilterSort(list){
+        let t = [...list];
+        const qv = (q.value||'').toLowerCase();
+        if (qv) t = t.filter(x => (x.title||'').toLowerCase().includes(qv) || (users.find(u=>u.id===x.ownerId)?.displayName||'').toLowerCase().includes(qv));
+        if (statusSel.value && statusSel.value !== 'all') t = t.filter(x => x.status === statusSel.value);
+        if (sortSel.value === 'dueAsc') t.sort((a,b)=> (a.dueDate||'9999').localeCompare(b.dueDate||'9999'));
+        if (sortSel.value === 'dueDesc') t.sort((a,b)=> (b.dueDate||'').localeCompare(a.dueDate||''));
+        if (sortSel.value === 'status') t.sort((a,b)=> a.status.localeCompare(b.status));
+        if (sortSel.value === 'created') t.sort((a,b)=> (a.createdAt?.seconds||0)-(b.createdAt?.seconds||0));
+        return t;
+      }
+
+      function ownerChip(u){
+        const initials = (u?.displayName||u?.email||'').slice(0,2).toUpperCase();
+        return el('div', { className:'flex items-center gap-2' }, [
+          el('div', { className:'h-6 w-6 rounded-full bg-gray-200 grid place-items-center text-xs' }, [initials]),
+          el('span', { className:'truncate max-w-[120px]' }, [u ? (u.displayName||u.email) : 'Unassigned'])
+        ]);
+      }
+
+      async function updateTask(tid, patch){
+        await updateDoc(doc(db,'tasks',tid), patch);
+      }
+      async function deleteTask(tid){
+        if (!confirm('Delete this task?')) return;
+        await deleteDoc(doc(db,'tasks',tid));
+      }
+
+      function taskRow(t){
+        const row = el('div', { className:'grid gap-3 px-2 md:px-4 py-2 border-b items-center' });
+        row.style.gridTemplateColumns = '1fr 180px 160px 140px 44px';
+
+        // title (inline edit)
+        const titleBtn = el('button', { className:'text-left hover:underline' }, [t.title]);
+        titleBtn.onclick = () => {
+          const inp = el('input', { value:t.title, className:'border rounded-lg px-2 py-1 w-full' });
+          inp.onkeydown = (e)=>{ if(e.key==='Enter'){ inp.blur(); } };
+          inp.onblur = async ()=>{ if(inp.value!==t.title) await updateTask(t.id,{ title: inp.value }); titleBtn.textContent = inp.value; titleWrap.replaceWith(titleWrap = titleBtn); };
+          let titleWrap = inp; row.replaceChild(inp, row.children[0]); inp.focus();
+        };
+
+        const ownerWrap = el('div');
+        ownerWrap.append(ownerChip(users.find(u=>u.id===t.ownerId)));
+        ownerWrap.onclick = () => {
+          const select = el('select', { className:'border rounded-lg px-2 py-1 w-44' });
+          users.filter(u=>u.approved).forEach(u=> select.append(el('option', { value:u.id, selected: u.id===t.ownerId }, [u.displayName||u.email])));
+          select.onchange = async ()=>{ await updateTask(t.id,{ ownerId: select.value }); };
+          ownerWrap.replaceChildren(select);
+          select.focus();
+          select.onblur = ()=> ownerWrap.replaceChildren(ownerChip(users.find(u=>u.id===t.ownerId)));
+        };
+
+        const statusWrap = el('div');
+        const badge = el('span', { className: `chip ${statusByVal(t.status).cls}` }, [statusByVal(t.status).label]);
+        statusWrap.append(badge);
+        statusWrap.onclick = () => {
+          const select = el('select', { className:'border rounded-lg px-2 py-1 w-40' });
+          STATUS.forEach(s=> select.append(el('option', { value:s.value, selected: s.value===t.status }, [s.label])));
+          select.onchange = async ()=>{ await updateTask(t.id,{ status: select.value }); };
+          statusWrap.replaceChildren(select);
+          select.focus();
+          select.onblur = ()=> statusWrap.replaceChildren(el('span',{className:`chip ${statusByVal(t.status).cls}`},[statusByVal(t.status).label]));
+        };
+
+        const dueWrap = el('div', { className:'flex items-center gap-2' });
+        const dueBtn = el('button', { className:'hover:underline' }, [fmtDate(t.dueDate)]);
+        const warn = el('span', { className: overdue(t)?'text-red-500':'hidden' }, ['⚠️']);
+        dueBtn.onclick = () => {
+          const inp = el('input', { type:'date', value: t.dueDate || '' , className:'border rounded-lg px-2 py-1' });
+          inp.onchange = async ()=>{ await updateTask(t.id,{ dueDate: inp.value || null }); };
+          dueWrap.replaceChildren(inp, warn);
+          inp.focus();
+          inp.onblur = ()=> dueWrap.replaceChildren(el('button',{className:'hover:underline', onclick: dueBtn.onclick},[fmtDate(t.dueDate)]), warn);
+        };
+        dueWrap.append(dueBtn, warn);
+
+        const actions = el('div', { className:'flex items-center justify-end' });
+        const del = el('button', { className:'p-1 hover:bg-gray-100 rounded', title:'Delete' }, ['🗑️']);
+        del.onclick = ()=> deleteTask(t.id);
+        actions.append(del);
+
+        row.append(titleBtn, ownerWrap, statusWrap, dueWrap, actions);
+        return row;
+      }
+
+      function groupBlock(owner){
+        const key = owner?.id || 'unassigned';
+        const block = el('div', { className:'border rounded-xl overflow-hidden bg-white' });
+        const head = el('div', { className:'flex items-center justify-between px-3 py-2 bg-gray-50 border-b' });
+        head.append(
+          el('div', { className:'font-semibold' }, [ owner ? (owner.displayName||owner.email) : 'Unassigned' ]),
+          el('button', { className:'text-sm border rounded px-2 py-1', onclick:()=>{
+            list.classList.toggle('hidden');
+          } }, ['Collapse'])
+        );
+
+        // List
+        const list = el('div');
+        const headRow = el('div', { className:'hidden md:grid gap-3 px-3 py-2 text-xs font-medium text-gray-500 border-b' });
+        headRow.style.gridTemplateColumns = '1fr 180px 160px 140px 44px';
+        ['Task','Owner','Status','Due date',''].forEach(t => headRow.append(el('div',{},[t])));
+        list.append(headRow);
+
+        const groupTasks = applyFilterSort(tasks).filter(t => (t.ownerId||null) === (owner?.id||null));
+        groupTasks.forEach(t => list.append(taskRow(t)));
+
+        // Add row
+        const addRow = el('div', { className:'grid gap-3 px-3 py-2 items-center' });
+        addRow.style.gridTemplateColumns = '1fr 180px 160px 140px 44px';
+        const titleInp = el('input', { placeholder:'+ Add task', className:'border rounded-lg px-2 py-1 w-full' });
+        const ownerHint = el('div', { className:'text-gray-400 text-sm' }, ['Auto: Owner group']);
+        const statusHint = el('div', { className:'text-gray-400 text-sm' }, ['Default: Not Started']);
+        const dueInp = el('input', { type:'date', className:'border rounded-lg px-2 py-1' });
+        const addBtn = el('button', { className:'p-1 hover:bg-gray-100 rounded', title:'Add' }, ['➕']);
+        addBtn.onclick = async ()=>{
+          if (!titleInp.value.trim()) return;
+          await addDoc(collection(db,'tasks'), {
+            title: titleInp.value.trim(),
+            ownerId: owner?.id || null,
+            status: 'not_started',
+            dueDate: dueInp.value || null,
+            order: Date.now(),
+            createdAt: serverTimestamp(),
+            createdBy: auth.currentUser.uid,
+          });
+          titleInp.value=''; dueInp.value='';
+        };
+        addRow.append(titleInp, ownerHint, statusHint, dueInp, el('div',{className:'flex justify-end'},[addBtn]));
+
+        list.append(addRow);
+        block.append(head, list);
+        return block;
+      }
+
+      // Compose DOM
+      const page = el('div', { className:'max-w-6xl mx-auto' });
+      page.append(header, toolbar, tableHead);
+
+      // Mount groups container
+      page.append(groupsWrap);
+      root.append(page);
+
+      // Handlers
+      document.getElementById('logout').onclick = () => signOut(auth);
+      document.getElementById('invite').onclick = () => openInviteDialog();
+
+      function rerenderGroups(){
+        groupsWrap.replaceChildren();
+        const approvedUsers = users.filter(u=>u.approved);
+        // Make sure unassigned also shows if any
+        const ownerIds = new Set(approvedUsers.map(u=>u.id));
+        const hasUnassigned = applyFilterSort(tasks).some(t=>!t.ownerId);
+        approvedUsers.forEach(u=> groupsWrap.append(groupBlock(u)));
+        if (hasUnassigned) groupsWrap.append(groupBlock(null));
+      }
+
+      // Filters re-render
+      q.oninput = rerenderGroups;
+      statusSel.onchange = rerenderGroups;
+      sortSel.onchange = rerenderGroups;
+
+      rerenderGroups();
+
+      // ---- Invite / Approve Dialog (very simple) ----
+      function openInviteDialog(){
+        const overlay = el('div', { className:'fixed inset-0 bg-black/50 grid place-items-center' });
+        const card = el('div', { className:'bg-white rounded-2xl p-4 w-[640px] max-w-[95vw] space-y-4' });
+        const title = el('div', { className:'text-lg font-semibold' }, ['Invite / Approve Member']);
+        const close = el('button', { className:'absolute right-4 top-2 text-2xl', onclick:()=>overlay.remove() }, ['×']);
+
+        // Lists
+        const pendingWrap = el('div', {}, [ el('div', { className:'font-medium mb-1' }, ['Pending requests']) ]);
+        const pendingList = el('div', { className:'space-y-2 max-h-48 overflow-auto pr-1' });
+        const approvedWrap = el('div', {}, [ el('div', { className:'font-medium mb-1' }, ['Approved members']) ]);
+        const approvedList = el('div', { className:'space-y-2 max-h-40 overflow-auto pr-1' });
+
+        const pending = users.filter(u=>!u.approved);
+        const approved = users.filter(u=>u.approved);
+
+        if (pending.length===0) pendingList.append(el('div',{className:'text-sm text-gray-500'},['No pending requests.']));
+        pending.forEach(u=> {
+          const row = el('div', { className:'flex items-center justify-between p-2 rounded-md border' });
+          row.append(
+            el('div', {}, [ el('div',{className:'font-medium'},[u.displayName||u.email]), el('div',{className:'text-xs text-gray-500'},[u.email]) ]),
+            el('div', { className:'flex items-center gap-2' }, [
+              el('button', { className:'bg-black text-white rounded px-2 py-1', onclick: async ()=>{ await updateDoc(doc(db,'users',u.id),{ approved:true }); overlay.remove(); } }, ['Approve']),
+              el('button', { className:'border rounded px-2 py-1', onclick: async ()=>{ await updateDoc(doc(db,'users',u.id),{ approved:false }); overlay.remove(); } }, ['Reject'])
+            ])
+          );
+          pendingList.append(row);
+        });
+
+        approved.forEach(u=> {
+          const row = el('div', { className:'flex items-center justify-between text-sm p-2 rounded-md border' });
+          row.append(
+            el('div', {}, [u.displayName||u.email]),
+            el('div', { className:'flex items-center gap-2' }, [
+              el('span', { className:'px-2 py-1 bg-gray-100 rounded' }, ['member']),
+              el('button', { className:'border rounded px-2 py-1', onclick: async ()=>{ await updateDoc(doc(db,'users',u.id),{ approved:false }); overlay.remove(); } }, ['Revoke'])
+            ])
+          );
+          approvedList.append(row);
+        });
+
+        card.append(close, title, pendingWrap, pendingList, approvedWrap, approvedList);
+        overlay.append(card);
+        document.body.append(overlay);
+      }
+    }
+
+    // ----- Main auth observer -----
+    renderLoading();
+    onAuthStateChanged(auth, async (u) => {
+      if (!u) return renderAuth();
+
+      // Ensure user doc exists
+      const uref = doc(db,'users', u.uid);
+      const snap = await getDoc(uref);
+      if (!snap.exists()) {
+        await setDoc(uref, {
+          email: u.email,
+          displayName: u.email?.split('@')[0],
+          role: 'member',
+          approved: false,
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      // Subscribe to users + tasks (real‑time)
+      const state = { me: null, users: [], tasks: [] };
+
+      const unsubUsers = onSnapshot(query(collection(db,'users')), (qs)=>{
+        state.users = qs.docs.map(d=> ({ id: d.id, ...d.data() }));
+        state.me = state.users.find(x=> x.id === u.uid);
+        if (!state.me?.approved) renderAwaitingApproval(state.me || { email: u.email });
+        else renderBoard(state);
+      });
+
+      const unsubTasks = onSnapshot(query(collection(db,'tasks'), orderBy('order')), (qs)=>{
+        state.tasks = qs.docs.map(d=> ({ id: d.id, ...d.data() }));
+        if (state.me?.approved) renderBoard(state);
+      });
+
+      // Clean up on sign out
+      window.addEventListener('unload', ()=> { unsubUsers(); unsubTasks(); });
+    });
+  </script>
+</body>
+</html>
